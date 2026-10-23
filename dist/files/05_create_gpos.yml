@@ -1,0 +1,175 @@
+---
+# =============================================================================
+# Playbook: Group Policy Objects erstellen und verknüpfen
+# Beschreibung: Erstellt GPOs und verknüpft sie mit OUs
+# Voraussetzungen: AD DS installiert, OUs erstellt
+# =============================================================================
+
+- name: Group Policy Objects erstellen und konfigurieren
+  hosts: windows_servers
+  gather_facts: false
+
+  vars:
+    domain_dn: "DC=corp,DC=example,DC=com"
+
+    # GPO-Definitionen
+    gpo_definitions:
+      - name: "Password Policy"
+        description: "Unternehmensweite Passwort-Richtlinien"
+        link_to: "OU=Company,{{ domain_dn }}"
+        enabled: true
+        enforced: false
+
+      - name: "Account Lockout Policy"
+        description: "Konto-Sperrung nach fehlgeschlagenen Anmeldeversuchen"
+        link_to: "OU=Company,{{ domain_dn }}"
+        enabled: true
+        enforced: false
+
+      - name: "Desktop Restrictions"
+        description: "Desktop-Einschränkungen für Standardbenutzer"
+        link_to: "OU=Users,OU=Company,{{ domain_dn }}"
+        enabled: true
+        enforced: false
+
+      - name: "Windows Update Configuration"
+        description: "Windows Update Einstellungen für alle Computer"
+        link_to: "OU=Computers,OU=Company,{{ domain_dn }}"
+        enabled: true
+        enforced: false
+
+      - name: "Server Hardening"
+        description: "Sicherheitsrichtlinien für Server"
+        link_to: "OU=Servers,OU=Company,{{ domain_dn }}"
+        enabled: true
+        enforced: true
+
+      - name: "IT Department Exceptions"
+        description: "Erweiterte Rechte für IT-Abteilung"
+        link_to: "OU=IT,OU=Users,OU=Company,{{ domain_dn }}"
+        enabled: true
+        enforced: false
+
+  tasks:
+    # Schritt 1: Voraussetzungen prüfen
+    - name: "Schritt 1: GPO-Modul und Berechtigungen prüfen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module GroupPolicy -ErrorAction Stop
+          Import-Module ActiveDirectory -ErrorAction Stop
+          $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object System.Security.Principal.WindowsPrincipal($currentUser)
+          $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+          if (-not $isAdmin) {
+            Write-Error "Keine Administrator-Rechte vorhanden"
+            exit 1
+          }
+          Write-Output "SUCCESS: GPO-Modul geladen, Admin-Rechte vorhanden"
+        } catch {
+          Write-Error "Voraussetzungen nicht erfüllt: $_"
+          exit 1
+        }
+      register: prereq_check
+      changed_when: false
+
+    # Schritt 2: GPOs erstellen
+    - name: "Schritt 2: Group Policy Objects erstellen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module GroupPolicy
+          $gpoName = "{{ item.name }}"
+          $existingGPO = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+          if ($existingGPO) {
+            Write-Output "EXISTS: $gpoName"
+          } else {
+            New-GPO -Name $gpoName -Comment "{{ item.description }}" -ErrorAction Stop | Out-Null
+            Write-Output "CREATED: $gpoName"
+          }
+        } catch {
+          Write-Error "Fehler beim Erstellen von GPO '$gpoName': $_"
+          exit 1
+        }
+      loop: "{{ gpo_definitions }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: gpo_creation_result
+
+    # Schritt 3: GPOs mit OUs verknüpfen
+    - name: "Schritt 3: GPOs mit OUs verknüpfen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module GroupPolicy
+          $gpoName = "{{ item.name }}"
+          $targetOU = "{{ item.link_to }}"
+          $enabled = ${{ item.enabled | default(true) | string | upper }}
+          $enforced = ${{ item.enforced | default(false) | string | upper }}
+          $existingLink = Get-GPLink -Name $gpoName -Target $targetOU -ErrorAction SilentlyContinue
+          if ($existingLink) {
+            Set-GPLink -Name $gpoName -Target $targetOU -LinkEnabled $enabled -Enforced $enforced
+            Write-Output "UPDATED_LINK: $gpoName -> $targetOU"
+          } else {
+            New-GPLink -Name $gpoName -Target $targetOU -LinkEnabled $enabled -Enforced $enforced -ErrorAction Stop | Out-Null
+            Write-Output "LINKED: $gpoName -> $targetOU"
+          }
+        } catch {
+          Write-Error "Fehler bei GPO-Verknüpfung '$gpoName': $_"
+          exit 1
+        }
+      loop: "{{ gpo_definitions }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.link_to }}"
+      register: gpo_link_result
+
+    # Schritt 4: Passwort-Richtlinie konfigurieren
+    - name: "Schritt 4: Passwort-Richtlinie GPO konfigurieren"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module GroupPolicy
+          # Password Policy Settings
+          Set-GPRegistryValue -Name "Password Policy" -Key "HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -ValueName "MaximumPasswordAge" -Type String -Value "90" -ErrorAction SilentlyContinue
+          Set-GPRegistryValue -Name "Password Policy" -Key "HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -ValueName "MinimumPasswordLength" -Type String -Value "12" -ErrorAction SilentlyContinue
+          Set-GPRegistryValue -Name "Password Policy" -Key "HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -ValueName "PasswordComplexity" -Type String -Value "1" -ErrorAction SilentlyContinue
+          Set-GPRegistryValue -Name "Password Policy" -Key "HKLM\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters" -ValueName "PasswordHistorySize" -Type String -Value "24" -ErrorAction SilentlyContinue
+          Write-Output "SUCCESS: Password Policy konfiguriert"
+        } catch {
+          Write-Error "Fehler bei Password Policy: $_"
+        }
+      register: password_gpo_result
+
+    # Schritt 5: GPUpdate erzwingen
+    - name: "Schritt 5: Gruppenrichtlinien aktualisieren"
+      ansible.windows.win_shell: |
+        try {
+          gpupdate /force
+          Write-Output "SUCCESS: GPUpdate ausgeführt"
+        } catch {
+          Write-Error "GPUpdate fehlgeschlagen: $_"
+        }
+      register: gpupdate_result
+
+    # Schritt 6: Verifikation
+    - name: "Schritt 6: GPO-Konfiguration verifizieren"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module GroupPolicy
+          $allGPOs = Get-GPO -All | Sort-Object DisplayName
+          Write-Output "=== GPO-Übersicht ==="
+          foreach ($gpo in $allGPOs) {
+            $links = Get-GPLink -Name $gpo.DisplayName -ErrorAction SilentlyContinue
+            $linkInfo = if ($links) { "Linked" } else { "Not Linked" }
+            Write-Output "  $($gpo.DisplayName) [$linkInfo] (Status=$($gpo.GpoStatus))"
+          }
+          Write-Output "TOTAL: $($allGPOs.Count) GPOs"
+          Write-Output "STATUS: VERIFIED"
+        } catch {
+          Write-Error "GPO-Verifikation fehlgeschlagen: $_"
+          exit 1
+        }
+      register: gpo_verify
+      changed_when: false
+
+    - name: "Zusammenfassung: GPO-Konfiguration"
+      ansible.windows.win_debug:
+        msg:
+          - "✓ GPO-Konfiguration abgeschlossen"
+          - "  {{ gpo_verify.stdout_lines | select('match', 'TOTAL') | first | default('Unbekannt') }}"

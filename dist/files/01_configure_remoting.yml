@@ -1,0 +1,57 @@
+---
+# =============================================================================
+# Playbook: WinRM Remote-Verbindung konfigurieren
+# Beschreibung: Aktiviert und konfiguriert WinRM für Ansible-Verbindungen
+# Voraussetzungen: Lokaler Zugriff auf den Windows Server
+# =============================================================================
+
+- name: WinRM für Remote-Verwaltung konfigurieren
+  hosts: windows_servers
+  gather_facts: false
+  become: false
+
+  tasks:
+    # Schritt 1: WinRM-Service überprüfen
+    - name: "Schritt 1: WinRM-Service Status prüfen"
+      ansible.windows.win_shell: |
+        try {
+          $service = Get-Service -Name WinRM -ErrorAction Stop
+          Write-Output "STATUS: $($service.Status)"
+          Write-Output "STARTTYPE: $($service.StartType)"
+        } catch {
+          Write-Error "WinRM-Service nicht gefunden: $_"
+          exit 1
+        }
+      register: winrm_status
+      changed_when: false
+      failed_when: false
+
+    # Schritt 2: WinRM QuickConfig ausführen
+    - name: "Schritt 2: WinRM QuickConfig aktivieren"
+      ansible.windows.win_shell: |
+        try {
+          $null = winrm quickconfig -force -quiet
+          $cert = New-SelfSignedCertificate -DnsName "winserver" -CertStoreLocation "Cert:\LocalMachine\My" -NotAfter (Get-Date).AddYears(3)
+          $thumbprint = $cert.Thumbprint
+          $null = winrm create winrm/config/Listener?Address=*+Transport=HTTPS @{Hostname="winserver";CertificateThumbprint=$thumbprint}
+          $null = New-NetFirewallRule -DisplayName "WinRM HTTPS" -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow -ErrorAction SilentlyContinue
+          Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force
+          Restart-Service WinRM -Force
+          Write-Output "SUCCESS: WinRM HTTPS konfiguriert"
+        } catch {
+          Write-Error "Fehler bei WinRM-Konfiguration: $_"
+          exit 1
+        }
+      register: winrm_config_result
+
+    # Schritt 3: Verbindung testen
+    - name: "Schritt 3: WinRM-Verbindung testen"
+      ansible.windows.win_ping:
+      register: ping_result
+      retries: 3
+      delay: 10
+      until: ping_result is success
+
+    - name: "Erfolgsmeldung: WinRM ist erreichbar"
+      ansible.windows.win_debug:
+        msg: "✓ WinRM-Verbindung erfolgreich hergestellt!"

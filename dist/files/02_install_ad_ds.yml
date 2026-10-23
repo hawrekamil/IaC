@@ -1,0 +1,155 @@
+---
+# =============================================================================
+# Playbook: Active Directory Domain Services installieren
+# Beschreibung: Installiert AD DS und erstellt eine neue Domäne
+# Voraussetzungen: WinRM konfiguriert, Server-Neustart möglich
+# =============================================================================
+
+- name: Active Directory Domain Services installieren und konfigurieren
+  hosts: windows_servers
+  gather_facts: true
+
+  vars:
+    domain_name: "corp.example.com"
+    domain_netbios: "CORP"
+    safe_mode_password: "SafeModePass123!"
+    dns_forwarder: "8.8.8.8"
+    database_path: "C:\\Windows\\NTDS"
+    log_path: "C:\\Windows\\NTDS"
+    sysvol_path: "C:\\Windows\\SYSVOL"
+
+  tasks:
+    # Schritt 1: Statische IP konfigurieren
+    - name: "Schritt 1: Statische IP-Adresse setzen"
+      ansible.windows.win_shell: |
+        try {
+          $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+          $currentConfig = Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4
+          if ($currentConfig.Dhcp -eq 'Enabled') {
+            New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress "{{ ansible_host }}" -PrefixLength 24 -DefaultGateway "192.168.1.1"
+            Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses "127.0.0.1"
+            Write-Output "SUCCESS: Statische IP konfiguriert"
+          } else {
+            Write-Output "SKIP: IP bereits statisch konfiguriert"
+          }
+        } catch {
+          Write-Error "Fehler bei IP-Konfiguration: $_"
+          exit 1
+        }
+      register: ip_result
+      changed_when: "'SUCCESS' in ip_result.stdout"
+
+    # Schritt 2: AD DS Feature installieren
+    - name: "Schritt 2: AD DS und DNS Feature installieren"
+      ansible.windows.win_feature:
+        name:
+          - AD-Domain-Services
+          - DNS
+          - RSAT-AD-Tools
+          - RSAT-AD-PowerShell
+        include_management_tools: yes
+        include_sub_features: yes
+        state: present
+      register: ad_feature_install
+
+    # Schritt 3: Neustart wenn erforderlich
+    - name: "Schritt 3: Server neustarten (falls erforderlich)"
+      ansible.windows.win_reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 60
+        pre_reboot_delay: 30
+      when: ad_feature_install.reboot_required
+
+    # Schritt 4: Prüfen ob Domäne bereits existiert
+    - name: "Schritt 4: Prüfen ob Domäne bereits existiert"
+      ansible.windows.win_shell: |
+        try {
+          $domain = Get-ADDomain -ErrorAction SilentlyContinue
+          if ($domain) {
+            Write-Output "DOMAIN_EXISTS: $($domain.DNSRoot)"
+          } else {
+            Write-Output "DOMAIN_NOT_FOUND"
+          }
+        } catch {
+          Write-Output "DOMAIN_NOT_FOUND"
+        }
+      register: domain_check
+      changed_when: false
+
+    # Schritt 5: Neue AD-Domäne erstellen
+    - name: "Schritt 5: Neue AD-Forest erstellen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ADDSDeployment
+          $securePassword = ConvertTo-SecureString "{{ safe_mode_password }}" -AsPlainText -Force
+          Install-ADDSForest `
+            -DomainName "{{ domain_name }}" `
+            -DomainNetbiosName "{{ domain_netbios }}" `
+            -SafeModeAdministratorPassword $securePassword `
+            -DatabasePath "{{ database_path }}" `
+            -LogPath "{{ log_path }}" `
+            -SysvolPath "{{ sysvol_path }}" `
+            -InstallDNS:$true `
+            -NoRebootOnCompletion:$true `
+            -Force:$true
+          Write-Output "SUCCESS: AD Forest erstellt"
+        } catch {
+          Write-Error "Fehler bei AD-Installation: $_"
+          exit 1
+        }
+      register: ad_install_result
+      when: "'DOMAIN_NOT_FOUND' in domain_check.stdout"
+
+    - name: "Fehlerbehandlung: AD Installation fehlgeschlagen"
+      ansible.windows.win_fail:
+        msg: "AD DS Installation fehlgeschlagen: {{ ad_install_result.stderr }}"
+      when:
+        - ad_install_result is defined
+        - ad_install_result is failed
+
+    # Schritt 6: DNS Forwarder konfigurieren
+    - name: "Schritt 6: DNS Forwarder konfigurieren"
+      ansible.windows.win_shell: |
+        try {
+          Add-DnsServerForwarder -IPAddress "{{ dns_forwarder }}" -ErrorAction SilentlyContinue
+          Write-Output "SUCCESS: DNS Forwarder konfiguriert"
+        } catch {
+          Write-Error "Fehler bei DNS Forwarder: $_"
+        }
+      register: dns_result
+      when: "'DOMAIN_NOT_FOUND' in domain_check.stdout"
+
+    # Schritt 7: Server neustarten
+    - name: "Schritt 7: Server neustarten nach AD-Installation"
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+        post_reboot_delay: 120
+        pre_reboot_delay: 30
+      when: "'DOMAIN_NOT_FOUND' in domain_check.stdout"
+
+    # Schritt 8: Verifikation
+    - name: "Schritt 8: AD-Installation verifizieren"
+      ansible.windows.win_shell: |
+        try {
+          $domain = Get-ADDomain
+          $dc = Get-ADDomainController
+          Write-Output "DOMAIN: $($domain.DNSRoot)"
+          Write-Output "NETBIOS: $($domain.NetBIOSName)"
+          Write-Output "DC_NAME: $($dc.Name)"
+          Write-Output "SITE: $($dc.Site)"
+          Write-Output "STATUS: VERIFIED"
+        } catch {
+          Write-Error "Verifikation fehlgeschlagen: $_"
+          exit 1
+        }
+      register: verify_result
+      retries: 3
+      delay: 30
+      until: "'VERIFIED' in verify_result.stdout"
+
+    - name: "Erfolgsmeldung: AD DS Installation"
+      ansible.windows.win_debug:
+        msg:
+          - "✓ Active Directory erfolgreich installiert!"
+          - "  Domäne: {{ domain_name }}"
+          - "  NetBIOS: {{ domain_netbios }}"

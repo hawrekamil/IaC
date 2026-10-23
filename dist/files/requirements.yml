@@ -1,0 +1,20 @@
+---
+# Ansible Galaxy Requirements
+# Installation: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  # Windows-Module
+  - name: ansible.windows
+    version: ">=2.0.0"
+
+  # Community Windows
+  - name: community.windows
+    version: ">=2.0.0"
+
+  # WinRM-Verbindung
+  - name: ansible.netcommon
+    version: ">=5.0.0"
+
+  # Community General
+  - name: community.general
+    version: ">=7.0.0"

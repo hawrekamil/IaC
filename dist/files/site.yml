@@ -1,0 +1,117 @@
+---
+# =============================================================================
+# Haupt-Playbook: Vollständige Active Directory Einrichtung
+# Beschreibung: Führt alle Einrichtungsschritte in Reihenfolge aus
+# Verwendung: ansible-playbook -i inventory/inventory.ini site.yml
+# =============================================================================
+
+- name: "=========================================="
+  hosts: windows_servers
+  gather_facts: false
+  tasks:
+    - name: "Start der AD-Einrichtung"
+      ansible.windows.win_debug:
+        msg:
+          - "============================================"
+          - "  Active Directory Einrichtung gestartet"
+          - "  Ziel: {{ ansible_host }}"
+          - "============================================"
+
+# Phase 1: Vorbereitung
+- name: "Phase 1: WinRM und Verbindung vorbereiten"
+  hosts: windows_servers
+  gather_facts: false
+  tags: [phase1, preparation, remoting]
+  tasks:
+    - name: "WinRM-Verbindung testen"
+      ansible.windows.win_ping:
+      register: ping_test
+      retries: 3
+      delay: 15
+      until: ping_test is success
+
+    - name: "Fehler: Keine WinRM-Verbindung"
+      ansible.windows.win_fail:
+        msg: |
+          FEHLER: WinRM-Verbindung konnte nicht hergestellt werden!
+          Bitte prüfen Sie:
+          1. Ist WinRM auf dem Zielserver aktiviert?
+          2. Sind die Zugangsdaten korrekt?
+          3. Ist Port 5986 (HTTPS) erreichbar?
+          4. Führen Sie zuerst configure_remoting.yml aus
+      when: ping_test is failed
+
+# Phase 2: AD DS Installation
+- name: "Phase 2: Active Directory Domain Services installieren"
+  hosts: windows_servers
+  gather_facts: true
+  tags: [phase2, ad_install]
+  tasks:
+    - name: "AD DS installieren und Domäne erstellen"
+      ansible.builtin.include_tasks: playbooks/02_install_ad_ds.yml
+
+# Phase 3: OU-Struktur erstellen
+- name: "Phase 3: Organizational Units erstellen"
+  hosts: windows_servers
+  gather_facts: false
+  tags: [phase3, ous]
+  tasks:
+    - name: "OU-Struktur erstellen"
+      ansible.builtin.include_tasks: playbooks/03_create_ous.yml
+
+# Phase 4: Benutzer und Gruppen erstellen
+- name: "Phase 4: Benutzer und Gruppen erstellen"
+  hosts: windows_servers
+  gather_facts: false
+  tags: [phase4, users, groups]
+  tasks:
+    - name: "Benutzer und Gruppen erstellen"
+      ansible.builtin.include_tasks: playbooks/04_create_users.yml
+
+# Phase 5: Group Policy Objects konfigurieren
+- name: "Phase 5: Group Policy Objects konfigurieren"
+  hosts: windows_servers
+  gather_facts: false
+  tags: [phase5, gpos]
+  tasks:
+    - name: "GPOs erstellen und verknüpfen"
+      ansible.builtin.include_tasks: playbooks/05_create_gpos.yml
+
+# Phase 6: Abschluss und Verifikation
+- name: "Phase 6: Abschluss-Verifikation"
+  hosts: windows_servers
+  gather_facts: false
+  tags: [phase6, verification]
+  tasks:
+    - name: "Abschließende Verifikation"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+          Import-Module GroupPolicy
+          Write-Output "============================================"
+          Write-Output "  AD-EINRICHTUNG - ABSCHLUSSBERICHT"
+          Write-Output "============================================"
+          $domain = Get-ADDomain
+          Write-Output "  Domäne: $($domain.DNSRoot)"
+          Write-Output "  NetBIOS: $($domain.NetBIOSName)"
+          $ous = Get-ADOrganizationalUnit -Filter *
+          Write-Output "  OUs: $($ous.Count)"
+          $users = Get-ADUser -Filter *
+          Write-Output "  Benutzer: $($users.Count)"
+          $groups = Get-ADGroup -Filter *
+          Write-Output "  Gruppen: $($groups.Count)"
+          $gpos = Get-GPO -All
+          Write-Output "  GPOs: $($gpos.Count)"
+          Write-Output "============================================"
+          Write-Output "  STATUS: ERFOLGREICH ABGESCHLOSSEN"
+          Write-Output "============================================"
+        } catch {
+          Write-Error "Abschluss-Verifikation fehlgeschlagen: $_"
+          exit 1
+        }
+      register: final_report
+      changed_when: false
+
+    - name: "Abschlussbericht anzeigen"
+      ansible.windows.win_debug:
+        msg: "{{ final_report.stdout_lines }}"

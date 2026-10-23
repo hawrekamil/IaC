@@ -1,0 +1,246 @@
+---
+# =============================================================================
+# Playbook: Active Directory Benutzer erstellen
+# Beschreibung: Erstellt Benutzerkonten mit Gruppenmitgliedschaften
+# Voraussetzungen: AD DS installiert, OUs erstellt
+# =============================================================================
+
+- name: Active Directory Benutzer erstellen und konfigurieren
+  hosts: windows_servers
+  gather_facts: false
+
+  vars:
+    domain_dn: "DC=corp,DC=example,DC=com"
+    default_password: "InitialPass123!"
+
+    # Benutzer-Definitionen
+    ad_users:
+      # IT-Abteilung
+      - sam_account: "it.admin"
+        first_name: "Max"
+        last_name: "Mustermann"
+        display_name: "Max Mustermann"
+        email: "max.mustermann@corp.example.com"
+        ou_path: "OU=IT,OU=Users,OU=Company,{{ domain_dn }}"
+        description: "IT Administrator"
+        department: "IT"
+        title: "System Administrator"
+        groups:
+          - "Domain Admins"
+          - "Enterprise Admins"
+        enabled: true
+        password_never_expires: true
+
+      - sam_account: "it.support1"
+        first_name: "Anna"
+        last_name: "Schmidt"
+        display_name: "Anna Schmidt"
+        email: "anna.schmidt@corp.example.com"
+        ou_path: "OU=IT,OU=Users,OU=Company,{{ domain_dn }}"
+        description: "IT Support"
+        department: "IT"
+        title: "Support Specialist"
+        groups:
+          - "IT Support"
+        enabled: true
+
+      # HR-Abteilung
+      - sam_account: "hr.manager"
+        first_name: "Thomas"
+        last_name: "Weber"
+        display_name: "Thomas Weber"
+        email: "thomas.weber@corp.example.com"
+        ou_path: "OU=HR,OU=Users,OU=Company,{{ domain_dn }}"
+        description: "HR Manager"
+        department: "HR"
+        title: "Human Resources Manager"
+        groups:
+          - "HR Managers"
+        enabled: true
+
+      # Finance-Abteilung
+      - sam_account: "finance.lead"
+        first_name: "Sarah"
+        last_name: "Fischer"
+        display_name: "Sarah Fischer"
+        email: "sarah.fischer@corp.example.com"
+        ou_path: "OU=Finance,OU=Users,OU=Company,{{ domain_dn }}"
+        description: "Finance Lead"
+        department: "Finance"
+        title: "Finance Lead"
+        groups:
+          - "Finance Team"
+        enabled: true
+
+      # Service Accounts
+      - sam_account: "svc_backup"
+        first_name: "Service"
+        last_name: "Backup"
+        display_name: "Service Account - Backup"
+        email: ""
+        ou_path: "OU=ServiceAccounts,OU=Users,OU=Company,{{ domain_dn }}"
+        description: "Service Account for Backup Operations"
+        department: "IT"
+        title: "Service Account"
+        groups:
+          - "Backup Operators"
+        enabled: true
+        password_never_expires: true
+
+      - sam_account: "svc_monitoring"
+        first_name: "Service"
+        last_name: "Monitoring"
+        display_name: "Service Account - Monitoring"
+        email: ""
+        ou_path: "OU=ServiceAccounts,OU=Users,OU=Company,{{ domain_dn }}"
+        description: "Service Account for Monitoring"
+        department: "IT"
+        title: "Service Account"
+        groups:
+          - "Performance Monitor Users"
+        enabled: true
+        password_never_expires: true
+
+  tasks:
+    # Schritt 1: AD-Verbindung prüfen
+    - name: "Schritt 1: AD-Verbindung verifizieren"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory -ErrorAction Stop
+          $domain = Get-ADDomain -ErrorAction Stop
+          Write-Output "CONNECTED: $($domain.DNSRoot)"
+          Write-Output "FUNCTIONAL_LEVEL: $($domain.DomainMode)"
+        } catch {
+          Write-Error "AD-Verbindung fehlgeschlagen: $_"
+          exit 1
+        }
+      register: ad_check
+      changed_when: false
+
+    # Schritt 2: Sicherheitsgruppen erstellen
+    - name: "Schritt 2: Benötigte Sicherheitsgruppen erstellen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+          $groups = @(
+            @{Name="IT Support"; Path="OU=Security,OU=Groups,OU=Company,{{ domain_dn }}"; Scope="Global"},
+            @{Name="HR Managers"; Path="OU=Security,OU=Groups,OU=Company,{{ domain_dn }}"; Scope="Global"},
+            @{Name="Finance Team"; Path="OU=Security,OU=Groups,OU=Company,{{ domain_dn }}"; Scope="Global"},
+            @{Name="Sales Team"; Path="OU=Security,OU=Groups,OU=Company,{{ domain_dn }}"; Scope="Global"}
+          )
+          foreach ($group in $groups) {
+            $existing = Get-ADGroup -Filter "Name -eq '$($group.Name)'" -ErrorAction SilentlyContinue
+            if (-not $existing) {
+              New-ADGroup -Name $group.Name -Path $group.Path -GroupScope $group.Scope -GroupCategory Security -ErrorAction Stop
+              Write-Output "GROUP_CREATED: $($group.Name)"
+            } else {
+              Write-Output "GROUP_EXISTS: $($group.Name)"
+            }
+          }
+          Write-Output "SUCCESS: Gruppen verarbeitet"
+        } catch {
+          Write-Error "Fehler bei Gruppenerstellung: $_"
+          exit 1
+        }
+      register: group_result
+
+    # Schritt 3: Benutzer erstellen
+    - name: "Schritt 3: AD-Benutzer erstellen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+          $samAccount = "{{ item.sam_account }}"
+          $existingUser = Get-ADUser -Filter "SamAccountName -eq '$samAccount'" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+            Write-Output "EXISTS: $samAccount"
+          } else {
+            $securePassword = ConvertTo-SecureString "{{ default_password }}" -AsPlainText -Force
+            New-ADUser `
+              -SamAccountName $samAccount `
+              -GivenName "{{ item.first_name }}" `
+              -Surname "{{ item.last_name }}" `
+              -DisplayName "{{ item.display_name }}" `
+              -EmailAddress "{{ item.email }}" `
+              -Path "{{ item.ou_path }}" `
+              -Description "{{ item.description }}" `
+              -Department "{{ item.department }}" `
+              -Title "{{ item.title }}" `
+              -AccountPassword $securePassword `
+              -Enabled $true `
+              -ChangePasswordAtLogon $true `
+              -ErrorAction Stop
+            Write-Output "CREATED: $samAccount"
+          }
+        } catch {
+          Write-Error "Fehler bei Benutzer '$samAccount': $_"
+          exit 1
+        }
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.sam_account }} ({{ item.display_name }})"
+      register: user_creation_result
+      no_log: true
+
+    # Schritt 4: Gruppenmitgliedschaften setzen
+    - name: "Schritt 4: Gruppenmitgliedschaften konfigurieren"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+          $samAccount = "{{ item.sam_account }}"
+          $groupNames = "{{ item.groups | join(',') }}"
+          foreach ($groupName in $groupNames.Split(',')) {
+            $groupName = $groupName.Trim()
+            if ([string]::IsNullOrEmpty($groupName)) { continue }
+            try {
+              $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+              Add-ADGroupMember -Identity $group -Members $samAccount -ErrorAction SilentlyContinue
+              Write-Output "MEMBER_ADDED: $samAccount -> $groupName"
+            } catch {
+              Write-Output "MEMBER_SKIP: $samAccount -> $groupName (nicht gefunden)"
+            }
+          }
+          Write-Output "SUCCESS: $samAccount"
+        } catch {
+          Write-Error "Fehler bei Gruppenzuweisung: $_"
+        }
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.sam_account }}"
+      when: item.groups is defined and item.groups | length > 0
+      register: group_membership_result
+
+    # Schritt 5: Passwort-Richtlinien anwenden
+    - name: "Schritt 5: Passwort-Richtlinien setzen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+          $samAccount = "{{ item.sam_account }}"
+          $neverExpires = ${{ item.password_never_expires | default(false) | string | upper }}
+          Set-ADUser -Identity $samAccount -PasswordNeverExpires $neverExpires -ErrorAction Stop
+          Write-Output "PASSWORD_POLICY: $samAccount (NeverExpires=$neverExpires)"
+        } catch {
+          Write-Error "Fehler bei Passwort-Richtlinie: $_"
+        }
+      loop: "{{ ad_users }}"
+      loop_control:
+        label: "{{ item.sam_account }}"
+      register: password_policy_result
+
+    # Schritt 6: Verifikation
+    - name: "Schritt 6: Benutzer-Erstellung verifizieren"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+          $users = Get-ADUser -Filter * -Properties MemberOf
+          Write-Output "=== Benutzer-Übersicht ==="
+          foreach ($user in $users) {
+            Write-Output "  $($user.SamAccountName) | $($user.DisplayName) | Groups: $($user.MemberOf.Count)"
+          }
+          Write-Output "TOTAL: $($users.Count) Benutzer"
+          Write-Output "STATUS: VERIFIED"
+        } catch {
+          Write-Error "Verifikation fehlgeschlagen: $_"
+          exit 1
+        }
+      register: user_verify
+      changed_when: false

@@ -1,0 +1,157 @@
+---
+# =============================================================================
+# Playbook: Organizational Units erstellen
+# Beschreibung: Erstellt OU-Struktur in Active Directory
+# Voraussetzungen: AD DS installiert und Domäne konfiguriert
+# =============================================================================
+
+- name: Organizational Units in Active Directory erstellen
+  hosts: windows_servers
+  gather_facts: false
+
+  vars:
+    domain_dn: "DC=corp,DC=example,DC=com"
+
+    # OU-Struktur Definition
+    ou_structure:
+      - name: "Company"
+        path: "{{ domain_dn }}"
+        description: "Haupt-OU für die Organisation"
+        protected: true
+        children:
+          - name: "Users"
+            description: "Alle Benutzerkonten"
+            children:
+              - name: "IT"
+                description: "IT-Abteilung Benutzer"
+              - name: "HR"
+                description: "Personalabteilung Benutzer"
+              - name: "Finance"
+                description: "Finanzabteilung Benutzer"
+              - name: "Sales"
+                description: "Vertriebsabteilung Benutzer"
+              - name: "ServiceAccounts"
+                description: "Service-Konten"
+          - name: "Groups"
+            description: "Sicherheitsgruppen"
+            children:
+              - name: "Security"
+                description: "Sicherheitsgruppen"
+              - name: "Distribution"
+                description: "Verteilergruppen"
+          - name: "Computers"
+            description: "Computer-Konten"
+            children:
+              - name: "Workstations"
+                description: "Client-Computer"
+              - name: "Servers"
+                description: "Server-Konten"
+          - name: "Servers"
+            description: "Server-OU für GPO-Verknüpfung"
+            children:
+              - name: "DomainControllers"
+                description: "Domain Controller"
+              - name: "ApplicationServers"
+                description: "Anwendungsserver"
+              - name: "FileServers"
+                description: "Dateiserver"
+
+  tasks:
+    # Schritt 1: AD-Modul laden und Verbindung prüfen
+    - name: "Schritt 1: AD PowerShell-Modul laden"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory -ErrorAction Stop
+          $domain = Get-ADDomain
+          Write-Output "CONNECTED: $($domain.DNSRoot)"
+        } catch {
+          Write-Error "AD-Modul nicht verfügbar: $_"
+          exit 1
+        }
+      register: ad_module_check
+      changed_when: false
+
+    - name: "Fehler: AD-Modul nicht verfügbar"
+      ansible.windows.win_fail:
+        msg: "Active Directory PowerShell-Modul ist nicht verfügbar. Bitte AD DS installieren."
+      when: "'CONNECTED' not in ad_module_check.stdout"
+
+    # Schritt 2: OU-Struktur erstellen (rekursiv)
+    - name: "Schritt 2: OU-Struktur rekursiv erstellen"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+
+          function Create-OUHierarchy {
+            param([array]$OUs, [string]$ParentPath)
+            foreach ($ou in $OUs) {
+              $ouDN = "OU=$($ou.name),$ParentPath"
+              $existing = Get-ADOrganizationalUnit -Filter "Name -eq '$($ou.name)'" -SearchBase "$ParentPath" -SearchScope OneLevel -ErrorAction SilentlyContinue
+              if (-not $existing) {
+                New-ADOrganizationalUnit -Name $ou.name -Path $ParentPath -Description $ou.description -ProtectedFromAccidentalDeletion $true -ErrorAction Stop
+                Write-Output "CREATED: $ouDN"
+              } else {
+                Write-Output "EXISTS: $ouDN"
+              }
+              if ($ou.children) {
+                Create-OUHierarchy -OUs $ou.children -ParentPath $ouDN
+              }
+            }
+          }
+
+          # Haupt-OUs erstellen
+          $topOUs = @(
+            @{name="Company"; path="{{ domain_dn }}"; description="Haupt-OU"}
+          )
+          foreach ($topOU in $topOUs) {
+            $ouDN = "OU=$($topOU.name),$($topOU.path)"
+            $existing = Get-ADOrganizationalUnit -Filter "Name -eq '$($topOU.name)'" -SearchBase "$($topOU.path)" -SearchScope OneLevel -ErrorAction SilentlyContinue
+            if (-not $existing) {
+              New-ADOrganizationalUnit -Name $topOU.name -Path $topOU.path -Description $topOU.description -ProtectedFromAccidentalDeletion $true
+              Write-Output "CREATED: $ouDN"
+            } else {
+              Write-Output "EXISTS: $ouDN"
+            }
+          }
+
+          # Child-OUs über JSON-Struktur erstellen
+          $jsonStructure = '{{ ou_structure | to_json }}'
+          $structure = $jsonStructure | ConvertFrom-Json
+          foreach ($topOU in $structure) {
+            $parentDN = "OU=$($topOU.name),$($topOU.path)"
+            if ($topOU.children) {
+              Create-OUHierarchy -OUs $topOU.children -ParentPath $parentDN
+            }
+          }
+
+          Write-Output "SUCCESS: Alle OUs verarbeitet"
+        } catch {
+          Write-Error "Fehler bei OU-Erstellung: $_"
+          exit 1
+        }
+      register: ou_creation_result
+
+    # Schritt 3: Verifikation
+    - name: "Schritt 3: OU-Struktur verifizieren"
+      ansible.windows.win_shell: |
+        try {
+          Import-Module ActiveDirectory
+          $allOUs = Get-ADOrganizationalUnit -Filter * -Properties Name, DistinguishedName | Sort-Object DistinguishedName
+          Write-Output "=== OU-Struktur ==="
+          foreach ($ou in $allOUs) {
+            Write-Output "  $($ou.DistinguishedName)"
+          }
+          Write-Output "TOTAL: $($allOUs.Count) OUs"
+          Write-Output "STATUS: VERIFIED"
+        } catch {
+          Write-Error "Verifikation fehlgeschlagen: $_"
+          exit 1
+        }
+      register: ou_verify
+      changed_when: false
+
+    - name: "Zusammenfassung: OU-Erstellung"
+      ansible.windows.win_debug:
+        msg:
+          - "✓ OU-Erstellung abgeschlossen"
+          - "  {{ ou_verify.stdout_lines | select('match', 'TOTAL') | first | default('Unbekannt') }}"

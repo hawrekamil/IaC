@@ -1,0 +1,81 @@
+---
+# =============================================================================
+# Role: common/tasks/error_handler.yml
+# Beschreibung: Zentrales Error-Handling für alle Playbooks
+# =============================================================================
+
+# Fehler protokollieren
+- name: "Error Handler: Fehler protokollieren"
+  ansible.windows.win_shell: |
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] ERROR: {{ error_message | default('Unbekannter Fehler') }}"
+    $logEntry += " | Task: {{ ansible_task_name | default('N/A') }}"
+    $logEntry += " | Host: {{ inventory_hostname }}"
+    $logPath = "C:\AnsibleLogs\errors.log"
+    $logDir = Split-Path $logPath -Parent
+    if (-not (Test-Path $logDir)) {
+      New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    Add-Content -Path $logPath -Value $logEntry -Encoding UTF8
+    Write-Output "LOGGED: $logEntry"
+  register: error_log_result
+  when: error_message is defined
+
+# Fehler an Windows Event Log schreiben
+- name: "Error Handler: Windows Event Log Eintrag"
+  ansible.windows.win_shell: |
+    try {
+      $source = "Ansible-AD-Setup"
+      if (-not [System.Diagnostics.EventLog]::SourceExists($source)) {
+        New-EventLog -LogName Application -Source $source -ErrorAction SilentlyContinue
+      }
+      Write-EventLog `
+        -LogName Application `
+        -Source $source `
+        -EventId 1001 `
+        -EntryType Error `
+        -Message "{{ error_message | default('Unbekannter Fehler') }}" `
+        -ErrorAction SilentlyContinue
+      Write-Output "EVENT_LOGGED"
+    } catch {
+      Write-Output "EVENT_LOG_FAILED: $_"
+    }
+  when: error_message is defined
+
+# Rollback-Funktion
+- name: "Error Handler: Rollback-Status prüfen"
+  ansible.windows.win_shell: |
+    $rollbackFile = "C:\AnsibleLogs\rollback_needed.flag"
+    if (Test-Path $rollbackFile) {
+      Write-Output "ROLLBACK_NEEDED"
+      $content = Get-Content $rollbackFile
+      Write-Output "REASON: $content"
+    } else {
+      Write-Output "NO_ROLLBACK"
+    }
+  register: rollback_check
+  changed_when: false
+
+# Zusammenfassung aller Fehler
+- name: "Error Handler: Fehlerzusammenfassung erstellen"
+  ansible.windows.win_shell: |
+    $logPath = "C:\AnsibleLogs\errors.log"
+    if (Test-Path $logPath) {
+      $errors = Get-Content $logPath
+      $errorCount = $errors.Count
+      Write-Output "=== FEHLERZUSAMMENFASSUNG ==="
+      Write-Output "Anzahl Fehler: $errorCount"
+      Write-Output ""
+      foreach ($error in $errors) {
+        Write-Output "  $error"
+      }
+    } else {
+      Write-Output "=== KEINE FEHLER ==="
+      Write-Output "Keine Fehler protokolliert."
+    }
+  register: error_summary
+  changed_when: false
+
+- name: "Error Handler: Zusammenfassung anzeigen"
+  ansible.windows.win_debug:
+    msg: "{{ error_summary.stdout_lines }}"

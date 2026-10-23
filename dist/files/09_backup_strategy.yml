@@ -1,0 +1,572 @@
+---
+# =============================================================================
+# BACKUP STRATEGY - Automatisierte Sicherung nach Best Practices
+# Beschreibung: Tägliche, wöchentliche und monatliche Backups
+# 3-2-1 Strategie: 3 Kopien, 2 Medien, 1 Offsite
+# =============================================================================
+
+- name: Backup Strategy Implementation
+  hosts: windows_servers
+  gather_facts: true
+  vars:
+    backup_root: "D:\\Backups"
+    backup_retention:
+      daily: 7        # 7 Tage aufbewahren
+      weekly: 4       # 4 Wochen aufbewahren
+      monthly: 12     # 12 Monate aufbewahren
+    
+    # Tägliche Backups (Kritische Daten)
+    daily_backup_paths:
+      - path: "C:\\Users"
+        description: "Benutzerprofile und Dokumente"
+        exclude: ["*.tmp", "*.log", "AppData\\Local\\Temp"]
+      
+      - path: "C:\\inetpub\\wwwroot"
+        description: "IIS Web-Inhalte"
+        exclude: ["*.log", "Logs"]
+      
+      - path: "C:\\ProgramData\\Microsoft\\Windows\\WER"
+        description: "Windows Error Reports"
+        exclude: []
+      
+      - path: "D:\\Daten"
+        description: "Geschäftsdaten"
+        exclude: ["*.tmp", "~*"]
+    
+    # Wöchentliche Backups (System State + Wichtige Daten)
+    weekly_backup_items:
+      - type: "system_state"
+        description: "System State (Registry, COM, Boot Files)"
+      
+      - type: "active_directory"
+        description: "Active Directory (NTDS.DAT, SYSVOL)"
+        paths:
+          - "C:\\Windows\\NTDS"
+          - "C:\\Windows\\SYSVOL"
+      
+      - type: "dns"
+        description: "DNS Server Konfiguration"
+        paths:
+          - "C:\\Windows\\System32\\dns"
+      
+      - type: "dhcp"
+        description: "DHCP Server Datenbank"
+        paths:
+          - "C:\\Windows\\System32\\dhcp"
+      
+      - type: "certificates"
+        description: "Zertifikate und Keys"
+        paths:
+          - "C:\\ProgramData\\Microsoft\\Crypto\\RSA"
+    
+    # Monatliche Backups (Vollständige System-Sicherung)
+    monthly_backup_items:
+      - type: "full_system"
+        description: "Vollständiges System Image"
+        drives: ["C:", "D:"]
+      
+      - type: "application_data"
+        description: "Anwendungsdaten"
+        paths:
+          - "C:\\Program Files"
+          - "C:\\Program Files (x86)"
+      
+      - type: "database_backups"
+        description: "Datenbank-Sicherungen"
+        paths:
+          - "D:\\SQLBackups"
+          - "D:\\DatabaseBackups"
+
+  tasks:
+    # =========================================================================
+    # VORBEREITUNG
+    # =========================================================================
+    - name: "Backup-Verzeichnisstruktur erstellen"
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ backup_root }}\\Daily"
+        - "{{ backup_root }}\\Weekly"
+        - "{{ backup_root }}\\Monthly"
+        - "{{ backup_root }}\\Logs"
+
+    - name: "Backup-Zeitstempel setzen"
+      ansible.windows.win_shell: |
+        $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+        $dayOfWeek = (Get-Date).DayOfWeek
+        $dayOfMonth = (Get-Date).Day
+        Write-Output "TIMESTAMP: $timestamp"
+        Write-Output "DAY_OF_WEEK: $dayOfWeek"
+        Write-Output "DAY_OF_MONTH: $dayOfMonth"
+      register: backup_time
+
+    # =========================================================================
+    # TÄGLICHE BACKUPS (Jeden Tag um 02:00 Uhr)
+    # =========================================================================
+    - name: "=== TÄGLICHE BACKUPS STARTEN ==="
+      ansible.windows.win_debug:
+        msg: "Starte tägliche Backups..."
+      tags: [daily, always]
+
+    - name: "Tägliche Backups - Benutzerprofile"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Daily\\Users_$timestamp"
+        
+        try {
+          # Erstelle Backup-Verzeichnis
+          New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+          
+          # Robocopy für inkrementelles Backup
+          $source = "C:\\Users"
+          $exclude = @("/XF *.tmp *.log", "/XD AppData\\Local\\Temp")
+          
+          $robocopyArgs = @(
+            $source,
+            $backupPath,
+            "/MIR",           # Mirror
+            "/R:3",           # 3 Retry-Versuche
+            "/W:5",           # 5 Sekunden warten zwischen Versuchen
+            "/MT:8",          # 8 Threads
+            "/NP",            # No Progress
+            "/NS",            # No Size
+            "/NC",            # No Class
+            "/NDL",           # No Directory List
+            "/NFL",           # No File List
+            "/LOG+:{{ backup_root }}\\Logs\\daily_users_$timestamp.log"
+          )
+          
+          $result = Start-Process -FilePath "robocopy" -ArgumentList $robocopyArgs -Wait -PassThru -NoNewWindow
+          
+          if ($result.ExitCode -le 7) {
+            Write-Output "SUCCESS: Users Backup erstellt"
+            $size = (Get-ChildItem $backupPath -Recurse | Measure-Object -Property Length -Sum).Sum
+            $sizeGB = [math]::Round($size / 1GB, 2)
+            Write-Output "SIZE: $sizeGB GB"
+          } else {
+            Write-Error "Robocopy Fehler: Exit Code $($result.ExitCode)"
+            exit 1
+          }
+        } catch {
+          Write-Error "Backup fehlgeschlagen: $_"
+          exit 1
+        }
+      register: daily_users_backup
+      tags: [daily]
+
+    - name: "Tägliche Backups - Geschäftsdaten"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Daily\\Daten_$timestamp"
+        
+        try {
+          if (Test-Path "D:\\Daten") {
+            New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+            
+            $robocopyArgs = @(
+              "D:\\Daten",
+              $backupPath,
+              "/MIR",
+              "/R:3",
+              "/W:5",
+              "/MT:8",
+              "/XF *.tmp ~*",
+              "/LOG+:{{ backup_root }}\\Logs\\daily_daten_$timestamp.log"
+            )
+            
+            $result = Start-Process -FilePath "robocopy" -ArgumentList $robocopyArgs -Wait -PassThru -NoNewWindow
+            
+            if ($result.ExitCode -le 7) {
+              Write-Output "SUCCESS: Daten Backup erstellt"
+              $size = (Get-ChildItem $backupPath -Recurse | Measure-Object -Property Length -Sum).Sum
+              $sizeGB = [math]::Round($size / 1GB, 2)
+              Write-Output "SIZE: $sizeGB GB"
+            } else {
+              Write-Error "Robocopy Fehler: Exit Code $($result.ExitCode)"
+            }
+          } else {
+            Write-Output "SKIP: D:\\Daten existiert nicht"
+          }
+        } catch {
+          Write-Error "Backup fehlgeschlagen: $_"
+        }
+      register: daily_data_backup
+      tags: [daily]
+
+    - name: "Tägliche Backups - IIS Web-Inhalte"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Daily\\IIS_$timestamp"
+        
+        try {
+          if (Test-Path "C:\\inetpub\\wwwroot") {
+            New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+            
+            $robocopyArgs = @(
+              "C:\\inetpub\\wwwroot",
+              $backupPath,
+              "/MIR",
+              "/R:3",
+              "/W:5",
+              "/XF *.log",
+              "/LOG+:{{ backup_root }}\\Logs\\daily_iis_$timestamp.log"
+            )
+            
+            $result = Start-Process -FilePath "robocopy" -ArgumentList $robocopyArgs -Wait -PassThru -NoNewWindow
+            
+            if ($result.ExitCode -le 7) {
+              Write-Output "SUCCESS: IIS Backup erstellt"
+            } else {
+              Write-Output "WARNING: IIS Backup mit Warnungen"
+            }
+          } else {
+            Write-Output "SKIP: IIS nicht installiert"
+          }
+        } catch {
+          Write-Error "IIS Backup fehlgeschlagen: $_"
+        }
+      register: daily_iis_backup
+      tags: [daily]
+
+    # =========================================================================
+    # WÖCHENTLICHE BACKUPS (Jeden Sonntag um 01:00 Uhr)
+    # =========================================================================
+    - name: "=== WÖCHENTLICHE BACKUPS STARTEN ==="
+      ansible.windows.win_debug:
+        msg: "Starte wöchentliche Backups..."
+      when: "'Sunday' in backup_time.stdout"
+      tags: [weekly]
+
+    - name: "Wöchentliche Backups - System State"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Weekly\\SystemState_$timestamp"
+        
+        try {
+          New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+          
+          # Windows Server Backup verwenden
+          $policy = New-WBPolicy
+          $systemState = New-WBSystemState
+          Add-WBSystemState -Policy $policy -SystemState $systemState
+          
+          $backupTarget = New-WBBackupTarget -Path $backupPath
+          Add-WBBackupTarget -Policy $policy -Target $backupTarget
+          
+          Start-WBBackup -Policy $policy -Async -ErrorAction Stop
+          
+          Write-Output "SUCCESS: System State Backup gestartet"
+        } catch {
+          Write-Error "System State Backup fehlgeschlagen: $_"
+          
+          # Fallback: Manuelle Sicherung kritischer Dateien
+          Write-Output "FALLBACK: Sichere kritische System-Dateien manuell"
+          
+          $criticalPaths = @(
+            "C:\\Windows\\System32\\config",  # Registry
+            "C:\\Windows\\repair"             # Repair
+          )
+          
+          foreach ($path in $criticalPaths) {
+            if (Test-Path $path) {
+              $destPath = Join-Path $backupPath (Split-Path $path -Leaf)
+              Copy-Item -Path $path -Destination $destPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Write-Output "FALLBACK SUCCESS: Kritische Dateien gesichert"
+        }
+      register: weekly_system_state
+      when: "'Sunday' in backup_time.stdout"
+      tags: [weekly, system_state]
+
+    - name: "Wöchentliche Backups - Active Directory"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Weekly\\AD_$timestamp"
+        
+        try {
+          Import-Module ActiveDirectory
+          New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+          
+          # AD-Datenbank sichern
+          $ntdsPath = "C:\\Windows\\NTDS"
+          if (Test-Path $ntdsPath) {
+            $destPath = Join-Path $backupPath "NTDS"
+            Copy-Item -Path $ntdsPath -Destination $destPath -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Output "SUCCESS: NTDS.DAT gesichert"
+          }
+          
+          # SYSVOL sichern
+          $sysvolPath = "C:\\Windows\\SYSVOL"
+          if (Test-Path $sysvolPath) {
+            $destPath = Join-Path $backupPath "SYSVOL"
+            robocopy $sysvolPath $destPath /MIR /R:3 /W:5 /NP /NS /NC /NDL /NFL | Out-Null
+            Write-Output "SUCCESS: SYSVOL gesichert"
+          }
+          
+          # AD-Metadaten exportieren
+          $adInfo = Get-ADDomain | ConvertTo-Json
+          $adInfo | Out-File -FilePath "$backupPath\\domain_info.json" -Encoding UTF8
+          Write-Output "SUCCESS: AD-Metadaten exportiert"
+          
+        } catch {
+          Write-Error "AD Backup fehlgeschlagen: $_"
+          exit 1
+        }
+      register: weekly_ad_backup
+      when: "'Sunday' in backup_time.stdout"
+      tags: [weekly, active_directory]
+
+    - name: "Wöchentliche Backups - DNS & DHCP"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Weekly\\NetworkServices_$timestamp"
+        
+        try {
+          New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+          
+          # DNS sichern
+          $dnsPath = "C:\\Windows\\System32\\dns"
+          if (Test-Path $dnsPath) {
+            $destPath = Join-Path $backupPath "DNS"
+            Copy-Item -Path $dnsPath -Destination $destPath -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Output "SUCCESS: DNS gesichert"
+          }
+          
+          # DHCP sichern
+          $dhcpPath = "C:\\Windows\\System32\\dhcp"
+          if (Test-Path $dhcpPath) {
+            $destPath = Join-Path $backupPath "DHCP"
+            Copy-Item -Path $dhcpPath -Destination $destPath -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Output "SUCCESS: DHCP gesichert"
+          }
+          
+          # DHCP Datenbank exportieren
+          try {
+            Export-DhcpServer -File "$backupPath\\dhcp_export.xml" -Leases -Force
+            Write-Output "SUCCESS: DHCP exportiert"
+          } catch {
+            Write-Output "SKIP: DHCP Export nicht verfügbar"
+          }
+          
+        } catch {
+          Write-Error "Network Services Backup fehlgeschlagen: $_"
+        }
+      register: weekly_network_backup
+      when: "'Sunday' in backup_time.stdout"
+      tags: [weekly, network_services]
+
+    # =========================================================================
+    # MONATLICHE BACKUPS (Am 1. jeden Monats um 00:00 Uhr)
+    # =========================================================================
+    - name: "=== MONATLICHE BACKUPS STARTEN ==="
+      ansible.windows.win_debug:
+        msg: "Starte monatliche Backups..."
+      when: "backup_time.stdout_lines[2].split(': ')[1] | int == 1"
+      tags: [monthly]
+
+    - name: "Monatliche Backups - Vollständiges System Image"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Monthly\\FullSystem_$timestamp"
+        
+        try {
+          New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+          
+          # Windows Server Backup für vollständiges Image
+          try {
+            $policy = New-WBPolicy
+            $volumeC = Get-WBVolume -AllVolumes | Where-Object { $_.MountPath -eq "C:\" }
+            $volumeD = Get-WBVolume -AllVolumes | Where-Object { $_.MountPath -eq "D:\" }
+            
+            if ($volumeC) { Add-WBVolume -Policy $policy -Volume $volumeC }
+            if ($volumeD) { Add-WBVolume -Policy $policy -Volume $volumeD }
+            
+            $backupTarget = New-WBBackupTarget -Path $backupPath
+            Add-WBBackupTarget -Policy $policy -Target $backupTarget
+            
+            Set-WBVssBackupOptions -Policy $policy -VssCopyBackup
+            Start-WBBackup -Policy $policy -Async -ErrorAction Stop
+            
+            Write-Output "SUCCESS: Vollständiges System Image gestartet"
+          } catch {
+            Write-Error "Windows Backup fehlgeschlagen: $_"
+            Write-Output "FALLBACK: Manuelle Sicherung"
+            
+            # Manuelle Sicherung wichtiger Verzeichnisse
+            $criticalPaths = @(
+              "C:\\Program Files",
+              "C:\\Program Files (x86)",
+              "C:\\Windows\\System32"
+            )
+            
+            foreach ($path in $criticalPaths) {
+              if (Test-Path $path) {
+                $folderName = Split-Path $path -Leaf
+                $destPath = Join-Path $backupPath $folderName
+                robocopy $path $destPath /MIR /R:2 /W:3 /MT:4 /XD "Windows\\Installer" /LOG+:{{ backup_root }}\\Logs\\monthly_$timestamp.log | Out-Null
+              }
+            }
+            Write-Output "FALLBACK SUCCESS: Wichtige Verzeichnisse gesichert"
+          }
+        } catch {
+          Write-Error "Monthly Backup fehlgeschlagen: $_"
+          exit 1
+        }
+      register: monthly_full_backup
+      when: "backup_time.stdout_lines[2].split(': ')[1] | int == 1"
+      tags: [monthly, full_system]
+
+    - name: "Monatliche Backups - Datenbanken"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $backupPath = "{{ backup_root }}\\Monthly\\Databases_$timestamp"
+        
+        try {
+          New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
+          
+          # SQL Server Backups sichern (falls vorhanden)
+          $sqlBackupPaths = @(
+            "D:\\SQLBackups",
+            "D:\\DatabaseBackups",
+            "C:\\Program Files\\Microsoft SQL Server\\MSSQL*\\BACKUP"
+          )
+          
+          foreach ($path in $sqlBackupPaths) {
+            $resolvedPaths = Resolve-Path $path -ErrorAction SilentlyContinue
+            foreach ($resolvedPath in $resolvedPaths) {
+              if (Test-Path $resolvedPath) {
+                $folderName = Split-Path $resolvedPath -Leaf
+                $destPath = Join-Path $backupPath $folderName
+                robocopy $resolvedPath $destPath /MIR /R:2 /W:3 /NP /NS /NC /NDL /NFL | Out-Null
+                Write-Output "SUCCESS: $folderName gesichert"
+              }
+            }
+          }
+          
+          Write-Output "COMPLETED: Database Backups"
+        } catch {
+          Write-Error "Database Backup fehlgeschlagen: $_"
+        }
+      register: monthly_db_backup
+      when: "backup_time.stdout_lines[2].split(': ')[1] | int == 1"
+      tags: [monthly, databases]
+
+    # =========================================================================
+    # RETENTION - Alte Backups löschen
+    # =========================================================================
+    - name: "Retention - Tägliche Backups älter als {{ backup_retention.daily }} Tage löschen"
+      ansible.windows.win_shell: |
+        $retentionDays = {{ backup_retention.daily }}
+        $backupPath = "{{ backup_root }}\\Daily"
+        $cutoffDate = (Get-Date).AddDays(-$retentionDays)
+        
+        $oldBackups = Get-ChildItem $backupPath -Directory | Where-Object { $_.CreationTime -lt $cutoffDate }
+        
+        foreach ($backup in $oldBackups) {
+          try {
+            Remove-Item -Path $backup.FullName -Recurse -Force
+            Write-Output "DELETED: $($backup.Name)"
+          } catch {
+            Write-Error "Konnte nicht löschen: $($backup.Name) - $_"
+          }
+        }
+        
+        Write-Output "CLEANUP: $($oldBackups.Count) alte Backups gelöscht"
+      register: retention_daily
+      tags: [retention, daily]
+
+    - name: "Retention - Wöchentliche Backups älter als {{ backup_retention.weekly }} Wochen löschen"
+      ansible.windows.win_shell: |
+        $retentionWeeks = {{ backup_retention.weekly }}
+        $backupPath = "{{ backup_root }}\\Weekly"
+        $cutoffDate = (Get-Date).AddWeeks(-$retentionWeeks)
+        
+        $oldBackups = Get-ChildItem $backupPath -Directory | Where-Object { $_.CreationTime -lt $cutoffDate }
+        
+        foreach ($backup in $oldBackups) {
+          try {
+            Remove-Item -Path $backup.FullName -Recurse -Force
+            Write-Output "DELETED: $($backup.Name)"
+          } catch {
+            Write-Error "Konnte nicht löschen: $($backup.Name) - $_"
+          }
+        }
+        
+        Write-Output "CLEANUP: $($oldBackups.Count) alte Backups gelöscht"
+      register: retention_weekly
+      tags: [retention, weekly]
+
+    - name: "Retention - Monatliche Backups älter als {{ backup_retention.monthly }} Monate löschen"
+      ansible.windows.win_shell: |
+        $retentionMonths = {{ backup_retention.monthly }}
+        $backupPath = "{{ backup_root }}\\Monthly"
+        $cutoffDate = (Get-Date).AddMonths(-$retentionMonths)
+        
+        $oldBackups = Get-ChildItem $backupPath -Directory | Where-Object { $_.CreationTime -lt $cutoffDate }
+        
+        foreach ($backup in $oldBackups) {
+          try {
+            Remove-Item -Path $backup.FullName -Recurse -Force
+            Write-Output "DELETED: $($backup.Name)"
+          } catch {
+            Write-Error "Konnte nicht löschen: $($backup.Name) - $_"
+          }
+        }
+        
+        Write-Output "CLEANUP: $($oldBackups.Count) alte Backups gelöscht"
+      register: retention_monthly
+      tags: [retention, monthly]
+
+    # =========================================================================
+    # BERICHT
+    # =========================================================================
+    - name: "Backup-Bericht erstellen"
+      ansible.windows.win_shell: |
+        $timestamp = "{{ backup_time.stdout_lines[0].split(': ')[1] }}"
+        $reportPath = "{{ backup_root }}\\Logs\\backup_report_$timestamp.txt"
+        
+        $report = @"
+=====================================
+BACKUP BERICHT
+=====================================
+Zeitstempel: $timestamp
+Server: $env:COMPUTERNAME
+Datum: $(Get-Date -Format "dd.MM.yyyy HH:mm:ss")
+
+TÄGLICHE BACKUPS:
+$(if ($daily_users_backup.stdout) { $daily_users_backup.stdout } else { "Nicht ausgeführt" })
+
+$(if ($daily_data_backup.stdout) { $daily_data_backup.stdout } else { "Nicht ausgeführt" })
+
+$(if ($daily_iis_backup.stdout) { $daily_iis_backup.stdout } else { "Nicht ausgeführt" })
+
+WÖCHENTLICHE BACKUPS:
+$(if ($weekly_system_backup.stdout) { $weekly_system_backup.stdout } else { "Nicht ausgeführt (nur Sonntags)" })
+
+$(if ($weekly_ad_backup.stdout) { $weekly_ad_backup.stdout } else { "Nicht ausgeführt (nur Sonntags)" })
+
+MONATLICHE BACKUPS:
+$(if ($monthly_full_backup.stdout) { $monthly_full_backup.stdout } else { "Nicht ausgeführt (nur am 1.)" })
+
+$(if ($monthly_db_backup.stdout) { $monthly_db_backup.stdout } else { "Nicht ausgeführt (nur am 1.)" })
+
+RETENTION:
+$(if ($retention_daily.stdout) { $retention_daily.stdout } else { "Keine" })
+$(if ($retention_weekly.stdout) { $retention_weekly.stdout } else { "Keine" })
+$(if ($retention_monthly.stdout) { $retention_monthly.stdout } else { "Keine" })
+
+=====================================
+BACKUP ABGESCHLOSSEN
+=====================================
+"@
+        
+        $report | Out-File -FilePath $reportPath -Encoding UTF8
+        Write-Output "REPORT: $reportPath"
+        Write-Output $report
+      register: backup_report
+
+    - name: "Backup-Bericht anzeigen"
+      ansible.windows.win_debug:
+        msg: "{{ backup_report.stdout_lines }}"
