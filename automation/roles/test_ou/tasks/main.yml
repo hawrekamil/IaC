@@ -1,0 +1,38 @@
+---
+- name: Check that the connected server belongs to the expected domain
+  ansible.windows.win_powershell:
+    script: |
+      param([string]$ExpectedDomain)
+      $ErrorActionPreference = 'Stop'
+      Import-Module ActiveDirectory
+      if ((Get-ADDomain).DistinguishedName -ne $ExpectedDomain) {
+        throw 'Connected domain does not match the configured lab domain'
+      }
+      $Ansible.Changed = $false
+    parameters:
+      ExpectedDomain: "{{ lab_domain_dn }}"
+  no_log: true
+
+- name: Ensure the configured test OU exists
+  microsoft.ad.ou:
+    name: "{{ lab_ou_name }}"
+    path: "{{ lab_domain_dn }}"
+    identity: "OU={{ lab_ou_name }},{{ lab_domain_dn }}"
+    state: present
+    protect_from_deletion: true
+  no_log: true
+
+- name: Verify the OU exists and is protected
+  ansible.windows.win_powershell:
+    script: |
+      param([string]$Identity)
+      $ErrorActionPreference = 'Stop'
+      Import-Module ActiveDirectory
+      $ou = Get-ADOrganizationalUnit -Identity $Identity -Properties ProtectedFromAccidentalDeletion
+      if (-not $ou.ProtectedFromAccidentalDeletion) {
+        throw 'Test OU is not protected from accidental deletion'
+      }
+      $Ansible.Changed = $false
+    parameters:
+      Identity: "OU={{ lab_ou_name }},{{ lab_domain_dn }}"
+  no_log: true

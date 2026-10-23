@@ -1,0 +1,8 @@
+---
+- name: Check the configured lab WinRM connection
+  hosts: windows_lab
+  gather_facts: false
+  tasks:
+    - name: Verify Windows remoting
+      ansible.windows.win_ping:
+      no_log: true

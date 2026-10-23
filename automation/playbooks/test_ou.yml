@@ -1,0 +1,6 @@
+---
+- name: Create and verify one test OU in an existing lab domain
+  hosts: windows_lab
+  gather_facts: false
+  roles:
+    - test_ou
